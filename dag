@@ -1,0 +1,509 @@
+
+from __future__ import annotations
+
+import html
+import os
+import re
+from collections import defaultdict
+from datetime import datetime
+
+import pendulum
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.providers.oracle.hooks.oracle import OracleHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ORACLE_CONN_ID = "oracle_source"
+POSTGRES_CONN_ID = "postgres_target"
+
+ORACLE_SCHEMA = Variable.get("ORACLE_SCHEMA")
+POSTGRES_SCHEMA = Variable.get("POSTGRES_SCHEMA")
+
+REPORT_DIR = Variable.get(
+    "METADATA_REPORT_DIR",
+    default_var="/opt/airflow/reports",
+)
+
+DAG_TIMEZONE = "Europe/Moscow"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def normalize_name(value):
+    """Case-insensitive comparison, with exact match preferred."""
+    if value is None:
+        return None
+    return str(value).casefold()
+
+
+def quote_ident(value):
+    """Safely quote a PostgreSQL identifier."""
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def quote_literal(value):
+    """Safely quote a SQL string literal."""
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def make_lookup(rows, key_fn):
+    result = defaultdict(list)
+    for row in rows:
+        result[key_fn(row)].append(row)
+    return result
+
+
+def resolve_name(source_name, target_names):
+    """
+    Prefer exact spelling; otherwise match case-insensitively.
+    If multiple candidates exist, do not guess.
+    """
+    exact = [n for n in target_names if n == source_name]
+    if len(exact) == 1:
+        return exact[0], None
+
+    candidates = [
+        n for n in target_names
+        if normalize_name(n) == normalize_name(source_name)
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0], None
+
+    if len(candidates) > 1:
+        return None, "AMBIGUOUS: " + ", ".join(candidates)
+
+    return None, "NOT FOUND"
+
+
+def write_html_report(rows):
+    os.makedirs(REPORT_DIR, exist_ok=True)
+
+    path = os.path.join(
+        REPORT_DIR,
+        "oracle_postgres_metadata_report.html",
+    )
+
+    columns = [
+        "category",
+        "object_name",
+        "status",
+        "oracle_value",
+        "postgres_value",
+        "details",
+    ]
+
+    output = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        "<title>Oracle → PostgreSQL metadata report</title>",
+        """
+        <style>
+        body {font-family:Arial,sans-serif;margin:24px}
+        table {border-collapse:collapse;width:100%}
+        th,td {border:1px solid #ccc;padding:8px;text-align:left;
+               vertical-align:top;overflow-wrap:anywhere}
+        th {background:#eee}
+        tr:nth-child(even) {background:#f8f8f8}
+        </style></head><body>
+        <h1>Oracle → PostgreSQL metadata report</h1>
+        """,
+        f"<p>Generated: {html.escape(datetime.now().isoformat())}</p>",
+        "<table><thead><tr>",
+    ]
+
+    for column in columns:
+        output.append(f"<th>{html.escape(column)}</th>")
+
+    output.append("</tr></thead><tbody>")
+
+    for row in rows:
+        output.append("<tr>")
+        for column in columns:
+            value = row.get(column, "")
+            output.append(
+                f"<td>{html.escape(str(value if value is not None else ''))}</td>"
+            )
+        output.append("</tr>")
+
+    output.append("</tbody></table></body></html>")
+
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("".join(output))
+
+    print(f"Report saved: {path}")
+
+
+def add_issue(rows, category, object_name, status,
+              oracle_value="", postgres_value="", details=""):
+    rows.append({
+        "category": category,
+        "object_name": object_name,
+        "status": status,
+        "oracle_value": oracle_value,
+        "postgres_value": postgres_value,
+        "details": details,
+    })
+
+
+# ============================================================
+# ORACLE METADATA
+# ============================================================
+
+def get_oracle_metadata(hook):
+    tables = hook.get_records(
+        """
+        SELECT TABLE_NAME, COMMENTS
+        FROM ALL_TAB_COMMENTS
+        WHERE OWNER = :1
+          AND TABLE_TYPE = 'TABLE'
+        """,
+        parameters=[ORACLE_SCHEMA],
+    )
+
+    columns = hook.get_records(
+        """
+        SELECT c.TABLE_NAME, c.COLUMN_NAME, cc.COMMENTS
+        FROM ALL_TAB_COLUMNS c
+        LEFT JOIN ALL_COL_COMMENTS cc
+          ON cc.OWNER = c.OWNER
+         AND cc.TABLE_NAME = c.TABLE_NAME
+         AND cc.COLUMN_NAME = c.COLUMN_NAME
+        WHERE c.OWNER = :1
+        """,
+        parameters=[ORACLE_SCHEMA],
+    )
+
+    indexes = hook.get_records(
+        """
+        SELECT
+            i.TABLE_NAME,
+            i.INDEX_NAME,
+            i.UNIQUENESS,
+            ic.COLUMN_POSITION,
+            ic.COLUMN_NAME
+        FROM ALL_INDEXES i
+        JOIN ALL_IND_COLUMNS ic
+          ON ic.INDEX_OWNER = i.OWNER
+         AND ic.INDEX_NAME = i.INDEX_NAME
+         AND ic.TABLE_OWNER = i.TABLE_OWNER
+         AND ic.TABLE_NAME = i.TABLE_NAME
+        WHERE i.TABLE_OWNER = :1
+        ORDER BY i.TABLE_NAME, i.INDEX_NAME, ic.COLUMN_POSITION
+        """,
+        parameters=[ORACLE_SCHEMA],
+    )
+
+    return tables, columns, indexes
+
+
+# ============================================================
+# POSTGRESQL METADATA
+# ============================================================
+
+def get_postgres_metadata(hook):
+    tables = hook.get_records(
+        """
+        SELECT c.relname, obj_description(c.oid, 'pg_class')
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        """,
+        parameters=(POSTGRES_SCHEMA,),
+    )
+
+    columns = hook.get_records(
+        """
+        SELECT
+            c.relname,
+            a.attname,
+            col_description(c.oid, a.attnum)
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        WHERE n.nspname = %s
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        """,
+        parameters=(POSTGRES_SCHEMA,),
+    )
+
+    indexes = hook.get_records(
+        """
+        SELECT
+            t.relname AS table_name,
+            i.relname AS index_name,
+            ix.indisunique,
+            array_agg(a.attname ORDER BY k.ordinality)
+                FILTER (WHERE a.attname IS NOT NULL) AS columns
+        FROM pg_index ix
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        LEFT JOIN LATERAL
+            unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality)
+            ON TRUE
+        LEFT JOIN pg_attribute a
+            ON a.attrelid = t.oid
+           AND a.attnum = k.attnum
+        WHERE n.nspname = %s
+        GROUP BY t.relname, i.relname, ix.indisunique
+        """,
+        parameters=(POSTGRES_SCHEMA,),
+    )
+
+    return tables, columns, indexes
+
+
+# ============================================================
+# MAIN TASK
+# ============================================================
+
+def sync_and_compare_metadata():
+    oracle = OracleHook(oracle_conn_id=ORACLE_CONN_ID)
+    postgres = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+    report = []
+
+    try:
+        (
+            oracle_tables,
+            oracle_columns,
+            oracle_indexes,
+        ) = get_oracle_metadata(oracle)
+
+        (
+            pg_tables,
+            pg_columns,
+            pg_indexes,
+        ) = get_postgres_metadata(postgres)
+
+        # Preserve real PostgreSQL names, including quoted identifiers.
+        pg_table_names = [row[0] for row in pg_tables]
+        pg_column_names = defaultdict(list)
+
+        for table_name, column_name, comment in pg_columns:
+            pg_column_names[table_name].append(column_name)
+
+        pg_table_map = {row[0]: row[1] for row in pg_tables}
+        pg_column_map = {
+            (row[0], row[1]): row[2]
+            for row in pg_columns
+        }
+
+        # ----------------------------------------------------
+        # 1. TABLE COMMENTS
+        # ----------------------------------------------------
+
+        for oracle_table, oracle_comment in oracle_tables:
+            pg_table, error = resolve_name(
+                oracle_table, pg_table_names
+            )
+
+            if error:
+                add_issue(
+                    report, "TABLE COMMENT", oracle_table,
+                    "TABLE NOT MATCHED",
+                    oracle_comment, "", error,
+                )
+                continue
+
+            pg_comment = pg_table_map.get(pg_table)
+
+            if pg_comment != oracle_comment:
+                # Apply Oracle comment to PostgreSQL.
+                sql = (
+                    f"COMMENT ON TABLE "
+                    f"{quote_ident(POSTGRES_SCHEMA)}."
+                    f"{quote_ident(pg_table)} IS "
+                    f"{quote_literal(oracle_comment)}"
+                )
+                postgres.run(sql)
+
+                add_issue(
+                    report, "TABLE COMMENT",
+                    f"{oracle_table} -> {pg_table}",
+                    "COMMENT SYNCHRONIZED",
+                    oracle_comment, pg_comment,
+                    "PostgreSQL comment updated",
+                )
+
+        # ----------------------------------------------------
+        # 2. COLUMN COMMENTS
+        # ----------------------------------------------------
+
+        for oracle_table, oracle_column, oracle_comment in oracle_columns:
+            pg_table, table_error = resolve_name(
+                oracle_table, pg_table_names
+            )
+
+            if table_error:
+                # Already reported at table level.
+                continue
+
+            candidates = pg_column_names.get(pg_table, [])
+            pg_column, column_error = resolve_name(
+                oracle_column, candidates
+            )
+
+            if column_error:
+                add_issue(
+                    report, "COLUMN COMMENT",
+                    f"{oracle_table}.{oracle_column}",
+                    "COLUMN NOT MATCHED",
+                    oracle_comment, "", column_error,
+                )
+                continue
+
+            pg_comment = pg_column_map.get((pg_table, pg_column))
+
+            if pg_comment != oracle_comment:
+                sql = (
+                    f"COMMENT ON COLUMN "
+                    f"{quote_ident(POSTGRES_SCHEMA)}."
+                    f"{quote_ident(pg_table)}."
+                    f"{quote_ident(pg_column)} IS "
+                    f"{quote_literal(oracle_comment)}"
+                )
+                postgres.run(sql)
+
+                add_issue(
+                    report, "COLUMN COMMENT",
+                    f"{oracle_table}.{oracle_column}",
+                    "COMMENT SYNCHRONIZED",
+                    oracle_comment, pg_comment,
+                    f"Target: {pg_table}.{pg_column}",
+                )
+
+        # ----------------------------------------------------
+        # 3. INDEX COMPARISON
+        # Compare table + uniqueness + ordered column list.
+        # Index names may differ after migration.
+        # ----------------------------------------------------
+
+        def oracle_index_groups(rows):
+            groups = {}
+            for table, index, uniqueness, position, column in rows:
+                key = (table, index, uniqueness)
+                groups.setdefault(key, []).append(
+                    (int(position), column)
+                )
+
+            result = []
+            for (table, index, uniqueness), cols in groups.items():
+                result.append((
+                    table,
+                    index,
+                    str(uniqueness).upper() == "UNIQUE",
+                    tuple(c for _, c in sorted(cols)),
+                ))
+            return result
+
+        def pg_index_groups(rows):
+            result = []
+            for table, index, unique, columns in rows:
+                result.append((
+                    table,
+                    index,
+                    bool(unique),
+                    tuple(columns or ()),
+                ))
+            return result
+
+        oracle_signatures = oracle_index_groups(oracle_indexes)
+        pg_signatures = pg_index_groups(pg_indexes)
+
+        # Normalize table/column names for matching, but keep
+        # exact source and target index details for the report.
+        def signature(item):
+            table, index, unique, columns = item
+            return (
+                normalize_name(table),
+                bool(unique),
+                tuple(normalize_name(c) for c in columns),
+            )
+
+        oracle_by_sig = defaultdict(list)
+        pg_by_sig = defaultdict(list)
+
+        for item in oracle_signatures:
+            oracle_by_sig[signature(item)].append(item)
+
+        for item in pg_signatures:
+            pg_by_sig[signature(item)].append(item)
+
+        all_signatures = set(oracle_by_sig) | set(pg_by_sig)
+
+        for sig in sorted(all_signatures, key=str):
+            source = oracle_by_sig.get(sig, [])
+            target = pg_by_sig.get(sig, [])
+
+            if len(source) > len(target):
+                for item in source[len(target):]:
+                    add_issue(
+                        report, "INDEX",
+                        f"{item[0]}.{item[1]}",
+                        "INDEX MISSING OR DIFFERENT",
+                        f"unique={item[2]}, columns={item[3]}",
+                        "",
+                        "No matching index signature in PostgreSQL",
+                    )
+
+            elif len(target) > len(source):
+                for item in target[len(source):]:
+                    add_issue(
+                        report, "INDEX",
+                        f"{item[0]}.{item[1]}",
+                        "EXTRA INDEX",
+                        "",
+                        f"unique={item[2]}, columns={item[3]}",
+                        "No matching index signature in Oracle",
+                    )
+
+        # ----------------------------------------------------
+        # 4. REPORT
+        # ----------------------------------------------------
+
+        write_html_report(report)
+
+        print(f"Metadata comparison finished. Issues: {len(report)}")
+
+    except Exception:
+        # Airflow marks the task as failed and keeps the traceback.
+        raise
+
+
+# ============================================================
+# DAG
+# ============================================================
+
+with DAG(
+    dag_id="oracle_postgres_metadata_sync",
+    description=(
+        "Synchronize Oracle table/column comments and compare indexes"
+    ),
+    start_date=pendulum.datetime(
+        2026, 1, 1, tz=DAG_TIMEZONE
+    ),
+    schedule=None,
+    catchup=False,
+    max_active_runs=1,
+    tags=["oracle", "postgresql", "migration", "metadata"],
+) as dag:
+
+    sync_metadata = PythonOperator(
+        task_id="sync_comments_compare_indexes",
+        python_callable=sync_and_compare_metadata,
+    )
